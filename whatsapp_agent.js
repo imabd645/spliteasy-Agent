@@ -144,11 +144,13 @@ async function startSock() {
         const isGroup = from.endsWith('@g.us');
         const fromMe = msg.key.fromMe;
         
-        // Only process direct chats and ignore messages sent by the bot itself
-        if (isGroup || fromMe) return;
+        // Ignore messages sent by the bot itself
+        if (fromMe) return;
         
-        // Extract raw phone number of sender
-        const phone = from.split('@')[0];
+        // Extract raw phone number of sender correctly (handles direct, groups, or status participants)
+        const sender = msg.key.participant || msg.key.remoteJid;
+        if (!sender) return;
+        const phone = sender.split('@')[0];
         
         // Get text content of the message
         let textContent = '';
