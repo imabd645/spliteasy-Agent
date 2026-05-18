@@ -1,12 +1,8 @@
-// Polyfill global crypto for older Node environments (e.g. Node 18.x) required by @whiskeysockets/baileys
-if (!global.crypto) {
-    global.crypto = require('crypto');
-}
-
 const { 
     default: makeWASocket, 
     useMultiFileAuthState, 
-    DisconnectReason 
+    DisconnectReason,
+    fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 const express = require('express');
 const fetch = require('node-fetch');
@@ -19,7 +15,7 @@ const pino = require('pino');
 const app = express();
 app.use(express.json());
 const PORT = 4000;
-const FLASK_URL = process.env.FLASK_URL || 'https://spliteasy-crazf5arbyh3ftfj.eastasia-01.azurewebsites.net';
+const FLASK_URL = 'http://127.0.0.1:5000';
 
 let sock = null;
 
@@ -51,7 +47,17 @@ async function startSock() {
     
     const { state, saveCreds } = await useMultiFileAuthState('whatsapp_auth_info');
     
+    let version = [2, 3000, 1017531287]; // Default fallback "last known good" version
+    try {
+        const { version: latestVersion, isLatest } = await fetchLatestBaileysVersion();
+        version = latestVersion;
+        console.log(`[WhatsApp Agent] Dynamically loaded WhatsApp Web v${version.join('.')}, isLatest: ${isLatest}`);
+    } catch (err) {
+        console.warn(`[WhatsApp Agent] Failed to fetch latest version, falling back to v${version.join('.')}: ${err.message}`);
+    }
+    
     sock = makeWASocket({
+        version,
         auth: state,
         logger: pino({ level: 'silent' }),
         printQRInTerminal: true
@@ -199,16 +205,6 @@ async function startSock() {
 
 // POST /send - Admin broadcast dispatching endpoint
 app.post('/send', async (req, res) => {
-    // API Key Authentication Check
-    const apiKey = process.env.WHATSAPP_API_KEY;
-    if (apiKey) {
-        const requestKey = req.headers['x-api-key'];
-        if (requestKey !== apiKey) {
-            console.warn('[Broadcast Dispatcher] Unauthorized access attempt with invalid API key.');
-            return res.status(401).json({ error: 'Unauthorized: Invalid API key.' });
-        }
-    }
-
     const { phone, message } = req.body;
     
     if (!phone || !message) {
@@ -231,8 +227,7 @@ app.post('/send', async (req, res) => {
 });
 
 // Start Express server & socket connection
-const HOST = process.env.HOST || '0.0.0.0';
-app.listen(PORT, HOST, () => {
-    console.log(`[Admin Dispatcher Server] Running on http://${HOST}:${PORT}`);
+app.listen(PORT, '127.0.0.1', () => {
+    console.log(`[Admin Dispatcher Server] Running on http://127.0.0.1:${PORT}`);
     startSock();
 });
