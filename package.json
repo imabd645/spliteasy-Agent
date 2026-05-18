@@ -1,0 +1,16 @@
+{
+  "name": "spliteasy-whatsapp-agent",
+  "version": "1.0.0",
+  "description": "WhatsApp Conversational AI Agent for SplitEasy",
+  "main": "whatsapp_agent.js",
+  "scripts": {
+    "start": "node whatsapp_agent.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.6.0",
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "qrcode": "^1.5.3",
+    "pino": "^9.0.0"
+  }
+}
