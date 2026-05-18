@@ -194,6 +194,16 @@ async function startSock() {
 
 // POST /send - Admin broadcast dispatching endpoint
 app.post('/send', async (req, res) => {
+    // API Key Authentication Check
+    const apiKey = process.env.WHATSAPP_API_KEY;
+    if (apiKey) {
+        const requestKey = req.headers['x-api-key'];
+        if (requestKey !== apiKey) {
+            console.warn('[Broadcast Dispatcher] Unauthorized access attempt with invalid API key.');
+            return res.status(401).json({ error: 'Unauthorized: Invalid API key.' });
+        }
+    }
+
     const { phone, message } = req.body;
     
     if (!phone || !message) {
@@ -216,7 +226,8 @@ app.post('/send', async (req, res) => {
 });
 
 // Start Express server & socket connection
-app.listen(PORT, '127.0.0.1', () => {
-    console.log(`[Admin Dispatcher Server] Running on http://127.0.0.1:${PORT}`);
+const HOST = process.env.HOST || '0.0.0.0';
+app.listen(PORT, HOST, () => {
+    console.log(`[Admin Dispatcher Server] Running on http://${HOST}:${PORT}`);
     startSock();
 });
