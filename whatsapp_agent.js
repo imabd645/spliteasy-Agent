@@ -139,7 +139,8 @@ async function startSock() {
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         if (!msg.message) return;
-        
+        console.log('[DEBUG] msg.key:', JSON.stringify(msg.key, null, 2));
+    console.log('[DEBUG] sock.user.id:', sock.user.id);
         const from = msg.key.remoteJid;
         const isGroup = from.endsWith('@g.us');
         const fromMe = msg.key.fromMe;
