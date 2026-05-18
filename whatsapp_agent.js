@@ -7,7 +7,8 @@ const {
     default: makeWASocket, 
     useMultiFileAuthState, 
     DisconnectReason,
-    fetchLatestBaileysVersion
+    fetchLatestBaileysVersion,
+    makeInMemoryStore
 } = require('@whiskeysockets/baileys');
 const express = require('express');
 const fetch = require('node-fetch');
@@ -24,6 +25,9 @@ const PORT = 4000;
 const FLASK_URL = process.env.FLASK_URL || 'https://spliteasy-crazf5arbyh3ftfj.eastasia-01.azurewebsites.net';
 
 let sock = null;
+
+// Create in-memory store to cache contacts (needed for @lid resolution)
+const store = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
 
 // Helper to notify Flask about Bot Status
 async function updateFlaskStatus(status, phone = null) {
@@ -47,6 +51,46 @@ async function updateFlaskStatus(status, phone = null) {
     }
 }
 
+// Resolve @lid JID to real phone number
+// WhatsApp uses privacy-preserving Linked IDs (@lid) in newer clients
+async function resolvePhoneFromJid(rawJid) {
+    // Strip device suffix first (e.g. "923001234567:12@s.whatsapp.net" → "923001234567")
+    const bare = rawJid.split('@')[0].split(':')[0];
+
+    if (!rawJid.endsWith('@lid')) {
+        // Normal JID — phone number is already in the bare part
+        return bare;
+    }
+
+    // Attempt 1: Check in-memory store contacts cache
+    try {
+        const contact = store.contacts[rawJid];
+        if (contact?.lid) {
+            const resolved = contact.lid.split('@')[0].split(':')[0];
+            console.log(`[LID Resolver] Resolved ${rawJid} via store.contacts.lid → +${resolved}`);
+            return resolved;
+        }
+    } catch (e) {
+        console.warn('[LID Resolver] store.contacts lookup failed:', e.message);
+    }
+
+    // Attempt 2: Query WhatsApp servers via onWhatsApp()
+    try {
+        const results = await sock.onWhatsApp(rawJid);
+        if (results && results.length > 0 && results[0]?.jid) {
+            const resolved = results[0].jid.split('@')[0].split(':')[0];
+            console.log(`[LID Resolver] Resolved ${rawJid} via onWhatsApp() → +${resolved}`);
+            return resolved;
+        }
+    } catch (e) {
+        console.warn('[LID Resolver] onWhatsApp() resolution failed:', e.message);
+    }
+
+    // Fallback: return the bare LID value (will likely fail DB lookup, but we log it clearly)
+    console.warn(`[LID Resolver] Could not resolve @lid JID: ${rawJid}. Using raw LID as fallback.`);
+    return bare;
+}
+
 // Start Baileys Socket Session
 async function startSock() {
     console.log('[WhatsApp Agent] Initializing Baileys Socket...');
@@ -68,6 +112,9 @@ async function startSock() {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: true
     });
+
+    // Bind store to socket so contacts/chats are cached automatically
+    store.bind(sock.ev);
     
     sock.ev.on('creds.update', saveCreds);
     
@@ -139,27 +186,26 @@ async function startSock() {
     sock.ev.on('messages.upsert', async (m) => {
         const msg = m.messages[0];
         if (!msg.message) return;
-        console.log('[DEBUG] msg.key:', JSON.stringify(msg.key, null, 2));
-    console.log('[DEBUG] sock.user.id:', sock.user.id);
+        
         const from = msg.key.remoteJid;
-        const isGroup = from.endsWith('@g.us');
         const fromMe = msg.key.fromMe;
         
         // Ignore messages sent by the bot itself
         if (fromMe) return;
         
-        // Extract raw phone number of sender correctly (handles direct, groups, or status participants)
-        const sender = msg.key.participant || msg.key.remoteJid;
-        if (!sender) return;
-        const phone = sender.split('@')[0];
+        const rawSender = msg.key.participant || msg.key.remoteJid;
+        if (!rawSender) return;
+
+        // Resolve real phone number (handles @lid, device suffixes, group participants)
+        const phone = await resolvePhoneFromJid(rawSender);
         
         // Get text content of the message
         let textContent = '';
         if (msg.message.conversation) {
             textContent = msg.message.conversation;
-        } else if (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) {
+        } else if (msg.message.extendedTextMessage?.text) {
             textContent = msg.message.extendedTextMessage.text;
-        } else if (msg.message.imageMessage && msg.message.imageMessage.caption) {
+        } else if (msg.message.imageMessage?.caption) {
             textContent = msg.message.imageMessage.caption;
         }
         
