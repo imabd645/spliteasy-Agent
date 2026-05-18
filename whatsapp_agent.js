@@ -1,3 +1,8 @@
+// Polyfill global crypto for Node 18.x and older (required by Baileys Web Crypto)
+if (typeof global.crypto === 'undefined') {
+    global.crypto = require('crypto');
+}
+
 const { 
     default: makeWASocket, 
     useMultiFileAuthState, 
@@ -15,7 +20,7 @@ const pino = require('pino');
 const app = express();
 app.use(express.json());
 const PORT = 4000;
-const FLASK_URL = 'http://127.0.0.1:5000';
+const FLASK_URL = process.env.FLASK_URL || 'https://spliteasy-crazf5arbyh3ftfj.eastasia-01.azurewebsites.net';
 
 let sock = null;
 
