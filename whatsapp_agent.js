@@ -1,3 +1,8 @@
+// Polyfill global crypto for older Node environments (e.g. Node 18.x) required by @whiskeysockets/baileys
+if (!global.crypto) {
+    global.crypto = require('crypto');
+}
+
 const { 
     default: makeWASocket, 
     useMultiFileAuthState, 
