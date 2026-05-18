@@ -175,7 +175,7 @@ async function startSock() {
         // Forward to Flask Conversational Brain webhook
         try {
             const webhookUrl = `${FLASK_URL}/api/whatsapp/webhook`;
-            const payload = { sender: phone, message: textContent };
+            const payload = { from_phone: phone, message_text: textContent };
             
             console.log(`[WhatsApp Webhook] Dispatching to webhook: ${webhookUrl}`);
             const response = await fetch(webhookUrl, {
