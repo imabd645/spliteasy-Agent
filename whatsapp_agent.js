@@ -1,21 +1,9 @@
-// Polyfill global crypto for Node 18.x and older (required by Baileys Web Crypto)
-if (typeof global.crypto === 'undefined') {
-    global.crypto = require('crypto');
-}
-
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    makeInMemoryStore
-} = require('@whiskeysockets/baileys');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const express = require('express');
 const fetch = require('node-fetch');
-const qrcode = require('qrcode');
+const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
-const pino = require('pino');
 
 // Express App Configuration
 const app = express();
@@ -24,12 +12,17 @@ app.use('/static', express.static(path.join(__dirname, 'static')));
 const PORT = 4000;
 const FLASK_URL = process.env.FLASK_URL || 'https://spliteasy-crazf5arbyh3ftfj.eastasia-01.azurewebsites.net';
 
-let sock = null;
+let currentQR = null;
+let isReady = false;
 
-// Create in-memory store to cache contacts (needed for @lid resolution)
-const store = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
+// Ensure static directory exists
+if (!fs.existsSync(path.join(__dirname, 'static'))) {
+    fs.mkdirSync(path.join(__dirname, 'static'));
+}
 
-// Helper to notify Flask about Bot Status
+// ---------------------------------------------------------------
+// Helper: Notify Flask about Bot Status
+// ---------------------------------------------------------------
 async function updateFlaskStatus(status, phone = null) {
     try {
         const payload = { status };
@@ -40,7 +33,7 @@ async function updateFlaskStatus(status, phone = null) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        
+
         if (res.ok) {
             console.log(`[Status Sync] Synchronized status "${status}" with Flask backend.`);
         } else {
@@ -51,229 +44,199 @@ async function updateFlaskStatus(status, phone = null) {
     }
 }
 
-// Resolve @lid JID to real phone number
-// WhatsApp uses privacy-preserving Linked IDs (@lid) in newer clients
-async function resolvePhoneFromJid(rawJid) {
-    // Strip device suffix first (e.g. "923001234567:12@s.whatsapp.net" → "923001234567")
-    const bare = rawJid.split('@')[0].split(':')[0];
-
-    if (!rawJid.endsWith('@lid')) {
-        // Normal JID — phone number is already in the bare part
-        return bare;
+// ---------------------------------------------------------------
+// WhatsApp Client Setup
+// ---------------------------------------------------------------
+const client = new Client({
+    authStrategy: new LocalAuth({ dataPath: './wwebjs_auth' }),
+    webVersion: '2.24.12.54',
+    webVersionCache: {
+        type: 'remote',
+        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.24.12.54.html',
+    },
+    puppeteer: {
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-extensions',
+            '--no-zygote'
+        ]
     }
+});
 
-    // Attempt 1: Check in-memory store contacts cache
+// ---------------------------------------------------------------
+// QR Code — save to static dir + notify Flask
+// ---------------------------------------------------------------
+client.on('qr', async (qr) => {
+    currentQR = qr;
+    console.log('[WhatsApp Agent] New QR Code received, saving to static directory...');
+
+    const qrPath = path.join(__dirname, 'static', 'whatsapp_qr.png');
     try {
-        const contact = store.contacts[rawJid];
-        if (contact?.lid) {
-            const resolved = contact.lid.split('@')[0].split(':')[0];
-            console.log(`[LID Resolver] Resolved ${rawJid} via store.contacts.lid → +${resolved}`);
-            return resolved;
-        }
-    } catch (e) {
-        console.warn('[LID Resolver] store.contacts lookup failed:', e.message);
-    }
-
-    // Attempt 2: Query WhatsApp servers via onWhatsApp()
-    try {
-        const results = await sock.onWhatsApp(rawJid);
-        if (results && results.length > 0 && results[0]?.jid) {
-            const resolved = results[0].jid.split('@')[0].split(':')[0];
-            console.log(`[LID Resolver] Resolved ${rawJid} via onWhatsApp() → +${resolved}`);
-            return resolved;
-        }
-    } catch (e) {
-        console.warn('[LID Resolver] onWhatsApp() resolution failed:', e.message);
-    }
-
-    // Fallback: return the bare LID value (will likely fail DB lookup, but we log it clearly)
-    console.warn(`[LID Resolver] Could not resolve @lid JID: ${rawJid}. Using raw LID as fallback.`);
-    return bare;
-}
-
-// Start Baileys Socket Session
-async function startSock() {
-    console.log('[WhatsApp Agent] Initializing Baileys Socket...');
-    
-    const { state, saveCreds } = await useMultiFileAuthState('whatsapp_auth_info');
-    
-    let version = [2, 3000, 1017531287]; // Default fallback "last known good" version
-    try {
-        const { version: latestVersion, isLatest } = await fetchLatestBaileysVersion();
-        version = latestVersion;
-        console.log(`[WhatsApp Agent] Dynamically loaded WhatsApp Web v${version.join('.')}, isLatest: ${isLatest}`);
+        await QRCode.toFile(qrPath, qr, {
+            color: { dark: '#000000', light: '#ffffff' },
+            width: 300
+        });
+        console.log(`[WhatsApp Agent] Auth QR generated successfully at: ${qrPath}`);
+        await updateFlaskStatus('qr_ready');
     } catch (err) {
-        console.warn(`[WhatsApp Agent] Failed to fetch latest version, falling back to v${version.join('.')}: ${err.message}`);
+        console.error('[WhatsApp Agent] Failed to save QR code image file:', err.message);
     }
-    
-    sock = makeWASocket({
-        version,
-        auth: state,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: true
-    });
+});
 
-    // Bind store to socket so contacts/chats are cached automatically
-    store.bind(sock.ev);
-    
-    sock.ev.on('creds.update', saveCreds);
-    
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
-            console.log('[WhatsApp Agent] New QR Code received, saving to static directory...');
-            const qrPath = path.join(__dirname, 'static', 'whatsapp_qr.png');
-            
-            // Ensure static directory exists
-            if (!fs.existsSync(path.join(__dirname, 'static'))) {
-                fs.mkdirSync(path.join(__dirname, 'static'));
-            }
-            
-            try {
-                await qrcode.toFile(qrPath, qr, {
-                    color: {
-                        dark: '#000000',
-                        light: '#ffffff'
-                    },
-                    width: 300
-                });
-                console.log(`[WhatsApp Agent] Auth QR generated successfully at: ${qrPath}`);
-                await updateFlaskStatus('qr_ready');
-            } catch (err) {
-                console.error('[WhatsApp Agent] Failed to save QR code image file:', err.message);
-            }
-        }
-        
-        if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log(`[WhatsApp Agent] Connection closed due to: ${lastDisconnect?.error?.message || 'Unknown'}. Reconnecting: ${shouldReconnect}`);
-            
-            await updateFlaskStatus('offline');
-            
-            if (shouldReconnect) {
-                setTimeout(startSock, 5000); // Reconnect in 5 seconds
-            } else {
-                console.log('[WhatsApp Agent] Logged out from WhatsApp. Purging old session credentials...');
-                try {
-                    fs.rmSync('whatsapp_auth_info', { recursive: true, force: true });
-                } catch (e) {
-                    console.error('[WhatsApp Agent] Failed to clean auth directory:', e.message);
-                }
-                setTimeout(startSock, 5000);
-            }
-        } else if (connection === 'open') {
-            console.log('[WhatsApp Agent] Connection established successfully!');
-            
-            // Delete the QR file if it exists to avoid showing stale code
-            const qrPath = path.join(__dirname, 'static', 'whatsapp_qr.png');
-            if (fs.existsSync(qrPath)) {
-                try {
-                    fs.unlinkSync(qrPath);
-                    console.log('[WhatsApp Agent] Cleaned up authentication QR code image.');
-                } catch (e) {
-                    console.error('[WhatsApp Agent] Failed to delete QR file:', e.message);
-                }
-            }
-            
-            const rawPhone = sock.user.id.split(':')[0];
-            console.log(`[WhatsApp Agent] Bot is online using phone number: +${rawPhone}`);
-            await updateFlaskStatus('online', rawPhone);
-        }
-    });
-    
-    // Listen for Incoming Messages
-    sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        if (!msg.message) return;
-        
-        const from = msg.key.remoteJid;
-        const fromMe = msg.key.fromMe;
-        
-        // Ignore messages sent by the bot itself
-        if (fromMe) return;
-        
-        const rawSender = msg.key.participant || msg.key.remoteJid;
-        if (!rawSender) return;
+// ---------------------------------------------------------------
+// Browser QR page (same as your working reference code)
+// ---------------------------------------------------------------
+app.get('/qr', async (req, res) => {
+    if (!currentQR) {
+        return res.send(`
+            <h2 style="font-family:sans-serif;text-align:center;margin-top:60px;">
+                No QR code right now (loading or already connected).
+            </h2>
+            <script>setTimeout(() => location.reload(), 2000)</script>
+        `);
+    }
+    try {
+        const qrImage = await QRCode.toDataURL(currentQR);
+        res.send(`
+            <div style="font-family:sans-serif;text-align:center;margin-top:50px;">
+                <h2>Scan with WhatsApp to connect SplitEasy Bot</h2>
+                <img src="${qrImage}" style="width:300px;height:300px;border:1px solid #ccc;padding:10px;border-radius:8px;" />
+                <p>Open WhatsApp → Linked Devices → Link a Device</p>
+                <script>setTimeout(() => location.reload(), 5000)</script>
+            </div>
+        `);
+    } catch (e) {
+        res.send('<p>Error generating QR image.</p>');
+    }
+});
 
-        // Resolve real phone number (handles @lid, device suffixes, group participants)
-        const phone = await resolvePhoneFromJid(rawSender);
-        
-        // Get text content of the message
-        let textContent = '';
-        if (msg.message.conversation) {
-            textContent = msg.message.conversation;
-        } else if (msg.message.extendedTextMessage?.text) {
-            textContent = msg.message.extendedTextMessage.text;
-        } else if (msg.message.imageMessage?.caption) {
-            textContent = msg.message.imageMessage.caption;
-        }
-        
-        textContent = textContent.trim();
-        if (!textContent) return;
-        
-        console.log(`[WhatsApp Incoming] Message from +${phone}: "${textContent}"`);
-        
-        // Mark message as read
+// ---------------------------------------------------------------
+// Authenticated
+// ---------------------------------------------------------------
+client.on('authenticated', () => {
+    console.log('[WhatsApp Agent] Session authenticated successfully.');
+});
+
+client.on('auth_failure', async (msg) => {
+    console.error('[WhatsApp Agent] Authentication failure:', msg);
+    await updateFlaskStatus('offline');
+});
+
+// ---------------------------------------------------------------
+// Ready — connection is open
+// ---------------------------------------------------------------
+client.on('ready', async () => {
+    isReady = true;
+    currentQR = null;
+
+    // Clean up QR image
+    const qrPath = path.join(__dirname, 'static', 'whatsapp_qr.png');
+    if (fs.existsSync(qrPath)) {
         try {
-            await sock.readMessages([msg.key]);
+            fs.unlinkSync(qrPath);
+            console.log('[WhatsApp Agent] Cleaned up authentication QR code image.');
         } catch (e) {
-            console.warn('[WhatsApp Agent] Failed to mark message as read:', e.message);
+            console.error('[WhatsApp Agent] Failed to delete QR file:', e.message);
         }
-        
-        // Forward to Flask Conversational Brain webhook
-        try {
-            const webhookUrl = `${FLASK_URL}/api/whatsapp/webhook`;
-            const payload = { from_phone: phone, message_text: textContent };
-            
-            console.log(`[WhatsApp Webhook] Dispatching to webhook: ${webhookUrl}`);
-            const response = await fetch(webhookUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-            
-            if (response.ok) {
-                const responseData = await response.json();
-                const replyText = responseData.reply;
-                
-                if (replyText) {
-                    console.log(`[WhatsApp Outgoing] Replying to +${phone}: "${replyText}"`);
-                    await sock.sendMessage(from, { text: replyText });
-                }
-            } else {
-                console.error(`[WhatsApp Webhook] Webhook returned status: ${response.status}`);
-                await sock.sendMessage(from, { 
-                    text: "⚠️ Sorry, I am experiencing temporary difficulties communicating with the SplitEasy engine. Please try again in a few moments." 
-                });
+    }
+
+    const phone = client.info.wid.user; // real phone number, e.g. "923427411527"
+    console.log(`[WhatsApp Agent] Connection established successfully!`);
+    console.log(`[WhatsApp Agent] Bot is online using phone number: +${phone}`);
+    await updateFlaskStatus('online', phone);
+});
+
+// ---------------------------------------------------------------
+// Disconnected
+// ---------------------------------------------------------------
+client.on('disconnected', async (reason) => {
+    isReady = false;
+    console.log(`[WhatsApp Agent] Disconnected: ${reason}`);
+    await updateFlaskStatus('offline');
+
+    // Reinitialize after short delay
+    console.log('[WhatsApp Agent] Reinitializing in 5 seconds...');
+    setTimeout(() => {
+        client.initialize();
+    }, 5000);
+});
+
+// ---------------------------------------------------------------
+// Incoming Messages
+// ---------------------------------------------------------------
+client.on('message', async (msg) => {
+    // Ignore status broadcasts and empty messages
+    if (msg.isStatus || !msg.body) return;
+
+    // Extract real phone number — always clean with whatsapp-web.js
+    // msg.author is set for group messages, msg.from for direct
+    const rawSender = msg.author || msg.from;
+    const phone = rawSender.split('@')[0]; // e.g. "923350806140"
+
+    const textContent = msg.body.trim();
+    if (!textContent) return;
+
+    console.log(`[WhatsApp Incoming] Message from +${phone}: "${textContent}"`);
+
+    // Mark as read
+    try {
+        await msg.getChat().then(chat => chat.sendSeen());
+    } catch (e) {
+        console.warn('[WhatsApp Agent] Failed to mark message as read:', e.message);
+    }
+
+    // Forward to Flask Conversational Brain webhook
+    try {
+        const webhookUrl = `${FLASK_URL}/api/whatsapp/webhook`;
+        const payload = { from_phone: phone, message_text: textContent };
+
+        console.log(`[WhatsApp Webhook] Dispatching to webhook: ${webhookUrl}`);
+        const response = await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (response.ok) {
+            const responseData = await response.json();
+            const replyText = responseData.reply;
+
+            if (replyText) {
+                console.log(`[WhatsApp Outgoing] Replying to +${phone}: "${replyText}"`);
+                await msg.reply(replyText);
             }
-        } catch (err) {
-            console.error('[WhatsApp Webhook] Webhook post failure:', err.message);
-            await sock.sendMessage(from, { 
-                text: "⚠️ Network connectivity issues: I couldn't reach the SplitEasy servers. Please notify the administrator." 
-            });
+        } else {
+            console.error(`[WhatsApp Webhook] Webhook returned status: ${response.status}`);
+            await msg.reply("⚠️ Sorry, I am experiencing temporary difficulties communicating with the SplitEasy engine. Please try again in a few moments.");
         }
-    });
-}
+    } catch (err) {
+        console.error('[WhatsApp Webhook] Webhook post failure:', err.message);
+        await msg.reply("⚠️ Network connectivity issues: I couldn't reach the SplitEasy servers. Please notify the administrator.");
+    }
+});
 
-// --- Express API Endpoints for Flask ---
-
-// POST /send - Admin broadcast dispatching endpoint
+// ---------------------------------------------------------------
+// Express API: POST /send — Flask broadcast dispatcher
+// ---------------------------------------------------------------
 app.post('/send', async (req, res) => {
     const { phone, message } = req.body;
-    
+
     if (!phone || !message) {
         return res.status(400).json({ error: 'Missing phone or message fields.' });
     }
-    
-    if (!sock || sock.ws.readyState !== 1) { // 1 = OPEN
+
+    if (!isReady) {
         return res.status(503).json({ error: 'WhatsApp bot daemon is currently offline or unauthenticated.' });
     }
-    
+
     try {
-        const jid = `${phone}@s.whatsapp.net`;
+        // Normalize to WhatsApp chat ID format
+        const chatId = `${phone.replace(/[^0-9]/g, '')}@c.us`;
         console.log(`[Broadcast Dispatcher] Sending message to +${phone}...`);
-        await sock.sendMessage(jid, { text: message });
+        await client.sendMessage(chatId, message);
         return res.status(200).json({ success: true });
     } catch (err) {
         console.error('[Broadcast Dispatcher] Failed to send broadcast message:', err.message);
@@ -281,8 +244,22 @@ app.post('/send', async (req, res) => {
     }
 });
 
-// Start Express server & socket connection
+// ---------------------------------------------------------------
+// Express API: GET /status — health check
+// ---------------------------------------------------------------
+app.get('/status', (req, res) => {
+    res.json({
+        status: isReady ? 'online' : 'offline',
+        qr_active: !!currentQR,
+        info: client.info || null
+    });
+});
+
+// ---------------------------------------------------------------
+// Start Express server & WhatsApp client
+// ---------------------------------------------------------------
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Admin Dispatcher Server] Running on http://0.0.0.0:${PORT}`);
-    startSock();
+    console.log(`[Admin Dispatcher Server] QR page available at http://0.0.0.0:${PORT}/qr`);
+    client.initialize();
 });
