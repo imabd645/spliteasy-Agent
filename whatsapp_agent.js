@@ -233,7 +233,7 @@ app.post('/send', async (req, res) => {
 });
 
 // Start Express server & socket connection
-app.listen(PORT, '127.0.0.1', () => {
-    console.log(`[Admin Dispatcher Server] Running on http://127.0.0.1:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Admin Dispatcher Server] Running on http://0.0.0.0:${PORT}`);
     startSock();
 });
