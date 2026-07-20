@@ -38,13 +38,6 @@ app.get('/static/whatsapp_qr.png', (req, res) => {
 
 app.use('/static', express.static(path.join(__dirname, 'static')));
 
-// Liveness probe for the host. Deliberately unauthenticated and free of any
-// detail worth leaking.
-app.get('/health', (req, res) => {
-    const connected = Boolean(sock && sock.ws && sock.ws.readyState === 1);
-    return res.status(200).json({ ok: true, whatsapp_connected: connected });
-});
-
 // Hosting platforms assign the port; 4000 is only the local default. This was
 // hardcoded, so the agent bound to the wrong port on any managed host.
 const PORT = process.env.PORT || 4000;
@@ -79,6 +72,32 @@ function secretsMatch(presented, expected) {
     if (a.length !== b.length) return false;
     return require('crypto').timingSafeEqual(a, b);
 }
+
+const BOOT_TIME = Date.now();
+
+function isWhatsAppConnected() {
+    return Boolean(sock && sock.ws && sock.ws.readyState === 1);
+}
+
+// Keep-alive and liveness probe, on two paths because they serve two callers:
+// an uptime pinger (cron-job.org and friends) and the platform's own health
+// check. Deliberately unauthenticated -- a scheduler cannot hold a secret
+// safely, and this discloses nothing an attacker could use.
+//
+// Free Render instances sleep after ~15 minutes without a request, and a
+// sleeping agent misses every WhatsApp message until something wakes it. A
+// request every 10 minutes keeps it up.
+//
+// Always 200, even when WhatsApp itself is disconnected: the pinger's job is to
+// keep the process warm, and a non-2xx would have it alarm on a condition it
+// cannot fix. Alert on `whatsapp_connected` in the body instead.
+app.get(['/ping', '/health'], (req, res) => {
+    return res.status(200).json({
+        ok: true,
+        uptime_seconds: Math.floor((Date.now() - BOOT_TIME) / 1000),
+        whatsapp_connected: isWhatsAppConnected(),
+    });
+});
 
 // Headers for every call out to Flask.
 function flaskHeaders() {
@@ -306,7 +325,10 @@ app.post('/send', async (req, res) => {
         return res.status(400).json({ error: 'Missing phone or message fields.' });
     }
     
-    if (!sock || sock.ws.readyState !== 1) { // 1 = OPEN
+    // Via the helper: `sock.ws` is undefined for a brief window during startup,
+    // so reading `.readyState` off it directly threw a TypeError instead of
+    // returning the intended 503.
+    if (!isWhatsAppConnected()) {
         return res.status(503).json({ error: 'WhatsApp bot daemon is currently offline or unauthenticated.' });
     }
     
