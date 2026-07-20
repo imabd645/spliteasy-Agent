@@ -19,9 +19,74 @@ const pino = require('pino');
 // Express App Configuration
 const app = express();
 app.use(express.json());
+
+// The pairing QR is a live credential: whoever scans it links their own
+// WhatsApp Web session to this number. It sat under a public static mount, so
+// on a public hostname it was readable by anyone who guessed the path. This
+// guarded route is registered *before* the static middleware so it wins.
+app.get('/static/whatsapp_qr.png', (req, res) => {
+    if (!secretsMatch(req.get('x-api-key'), WHATSAPP_API_KEY)) {
+        console.warn(`[QR] Rejected an unauthorized QR fetch from ${req.ip}`);
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const qrPath = path.join(__dirname, 'static', 'whatsapp_qr.png');
+    if (!fs.existsSync(qrPath)) {
+        return res.status(404).json({ error: 'No pairing QR is currently available.' });
+    }
+    return res.sendFile(qrPath);
+});
+
 app.use('/static', express.static(path.join(__dirname, 'static')));
-const PORT = 4000;
-const FLASK_URL = process.env.FLASK_URL || 'https://spliteasy-crazf5arbyh3ftfj.eastasia-01.azurewebsites.net';
+
+// Liveness probe for the host. Deliberately unauthenticated and free of any
+// detail worth leaking.
+app.get('/health', (req, res) => {
+    const connected = Boolean(sock && sock.ws && sock.ws.readyState === 1);
+    return res.status(200).json({ ok: true, whatsapp_connected: connected });
+});
+
+// Hosting platforms assign the port; 4000 is only the local default. This was
+// hardcoded, so the agent bound to the wrong port on any managed host.
+const PORT = process.env.PORT || 4000;
+
+// Flask Backend Configuration
+const FLASK_URL = process.env.FLASK_URL || 'https://splitkar.site';
+
+// Shared secret presented to Flask on /api/internal/* and the message webhook.
+// Must equal INTERNAL_API_KEY on the Flask side, or those calls are rejected.
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || '';
+
+// Shared secret Flask presents to *this* agent on /send. Must equal Flask's
+// WHATSAPP_API_KEY. Without it, anyone who can reach this host can send
+// WhatsApp messages from the linked number.
+const WHATSAPP_API_KEY = process.env.WHATSAPP_API_KEY || '';
+
+if (!INTERNAL_API_KEY) {
+    console.error('[Config] INTERNAL_API_KEY is not set. Flask will reject every ' +
+                  'status update and every forwarded message with 401.');
+}
+if (!WHATSAPP_API_KEY) {
+    console.error('[Config] WHATSAPP_API_KEY is not set. /send is UNPROTECTED — ' +
+                  'anyone who can reach this host can send messages as you.');
+}
+
+// Constant-time comparison, so a caller cannot recover the key by timing how
+// long a wrong guess takes to be rejected.
+function secretsMatch(presented, expected) {
+    if (!expected) return false;
+    const a = Buffer.from(String(presented || ''));
+    const b = Buffer.from(expected);
+    if (a.length !== b.length) return false;
+    return require('crypto').timingSafeEqual(a, b);
+}
+
+// Headers for every call out to Flask.
+function flaskHeaders() {
+    return {
+        'Content-Type': 'application/json',
+        'X-Internal-Key': INTERNAL_API_KEY
+    };
+}
 
 let sock = null;
 
@@ -33,12 +98,17 @@ async function updateFlaskStatus(status, phone = null) {
 
         const res = await fetch(`${FLASK_URL}/api/internal/update_whatsapp_status`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: flaskHeaders(),
             body: JSON.stringify(payload)
         });
-        
+
         if (res.ok) {
             console.log(`[Status Sync] Synchronized status "${status}" with Flask backend.`);
+        } else if (res.status === 401) {
+            console.error('[Status Sync] Flask rejected the internal key (401). ' +
+                          'INTERNAL_API_KEY here must match the Flask environment.');
+        } else if (res.status === 503) {
+            console.error('[Status Sync] Flask has no INTERNAL_API_KEY configured (503).');
         } else {
             console.error(`[Status Sync] Failed to sync status with Flask: ${res.status}`);
         }
@@ -182,28 +252,35 @@ async function startSock() {
             console.log(`[WhatsApp Webhook] Dispatching to webhook: ${webhookUrl}`);
             const response = await fetch(webhookUrl, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: flaskHeaders(),
                 body: JSON.stringify(payload)
             });
-            
+
             if (response.ok) {
                 const responseData = await response.json();
                 const replyText = responseData.reply;
-                
+
                 if (replyText) {
                     console.log(`[WhatsApp Outgoing] Replying to +${phone}: "${replyText}"`);
                     await sock.sendMessage(from, { text: replyText });
                 }
             } else {
+                if (response.status === 401) {
+                    console.error('[WhatsApp Webhook] Flask rejected the internal key (401). ' +
+                                  'INTERNAL_API_KEY must match on both sides.');
+                } else if (response.status === 404) {
+                    console.error('[WhatsApp Webhook] Webhook is disabled on Flask ' +
+                                  '(WHATSAPP_WEBHOOK_ENABLED=false).');
+                }
                 console.error(`[WhatsApp Webhook] Webhook returned status: ${response.status}`);
                 await sock.sendMessage(from, { 
-                    text: "⚠️ Sorry, I am experiencing temporary difficulties communicating with the SplitEasy engine. Please try again in a few moments." 
+                    text: "⚠️ Sorry, I am experiencing temporary difficulties communicating with the Splitkar engine. Please try again in a few moments." 
                 });
             }
         } catch (err) {
             console.error('[WhatsApp Webhook] Webhook post failure:', err.message);
             await sock.sendMessage(from, { 
-                text: "⚠️ Network connectivity issues: I couldn't reach the SplitEasy servers. Please notify the administrator." 
+                text: "⚠️ Network connectivity issues: I couldn't reach the Splitkar servers. Please notify the administrator." 
             });
         }
     });
@@ -211,10 +288,20 @@ async function startSock() {
 
 // --- Express API Endpoints for Flask ---
 
-// POST /send - Admin broadcast dispatching endpoint
+// POST /send - Admin broadcast dispatching endpoint.
+//
+// Flask presents its WHATSAPP_API_KEY as `x-api-key` (see
+// splitkar/services/whatsapp.py). This endpoint previously ignored that header
+// entirely, so once the agent was reachable on a public hostname, anyone could
+// send WhatsApp messages from the linked number.
 app.post('/send', async (req, res) => {
+    if (!secretsMatch(req.get('x-api-key'), WHATSAPP_API_KEY)) {
+        console.warn(`[Broadcast Dispatcher] Rejected an unauthorized /send from ${req.ip}`);
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
     const { phone, message } = req.body;
-    
+
     if (!phone || !message) {
         return res.status(400).json({ error: 'Missing phone or message fields.' });
     }
