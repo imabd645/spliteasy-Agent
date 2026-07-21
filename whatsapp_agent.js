@@ -150,6 +150,17 @@ async function startSock() {
     console.log('[WhatsApp Agent] Initializing Baileys Socket...');
     waConnected = false;
 
+    // Tear down any previous socket before opening a new one. Two live sockets
+    // on the same credentials make WhatsApp close BOTH with a "conflict"
+    // (connectionReplaced) -- so a reconnect must never leave the old one
+    // running. Its listeners are removed first so the teardown's own 'close'
+    // does not schedule yet another overlapping reconnect.
+    if (sock) {
+        try { sock.ev.removeAllListeners(); } catch (e) { /* already detached */ }
+        try { sock.end(undefined); } catch (e) { /* already ended */ }
+        sock = null;
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState('whatsapp_auth_info');
     
     let version = [2, 3000, 1017531287]; // Default fallback "last known good" version
@@ -336,14 +347,11 @@ app.post('/send', async (req, res) => {
     if (!phone || !message) {
         return res.status(400).json({ error: 'Missing phone or message fields.' });
     }
-    
-    // Via the helper: `sock.ws` is undefined for a brief window during startup,
-    // so reading `.readyState` off it directly threw a TypeError instead of
-    // returning the intended 503.
+
     if (!isWhatsAppConnected()) {
         return res.status(503).json({ error: 'WhatsApp bot daemon is currently offline or unauthenticated.' });
     }
-    
+
     try {
         const jid = `${phone}@s.whatsapp.net`;
         console.log(`[Broadcast Dispatcher] Sending message to +${phone}...`);
