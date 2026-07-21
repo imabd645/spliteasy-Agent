@@ -76,7 +76,12 @@ function secretsMatch(presented, expected) {
 const BOOT_TIME = Date.now();
 
 function isWhatsAppConnected() {
-    return Boolean(sock && sock.ws && sock.ws.readyState === 1);
+    // Authoritative connection state is tracked from Baileys' connection.update
+    // events (`waConnected`). The previous check read `sock.ws.readyState`, but
+    // on current @whiskeysockets/baileys `sock.ws` is a wrapper whose
+    // `readyState` is undefined -- so this was always false and every /send
+    // returned 503 even while the bot was online and handling chat normally.
+    return Boolean(sock && waConnected);
 }
 
 // Keep-alive and liveness probe, on two paths because they serve two callers:
@@ -108,6 +113,10 @@ function flaskHeaders() {
 }
 
 let sock = null;
+// Real WhatsApp connection state, driven only by connection.update
+// ('open' -> true, 'close' -> false). Never inferred from the socket's internal
+// fields, whose shape drifts between Baileys versions.
+let waConnected = false;
 
 // Helper to notify Flask about Bot Status
 async function updateFlaskStatus(status, phone = null) {
@@ -139,7 +148,8 @@ async function updateFlaskStatus(status, phone = null) {
 // Start Baileys Socket Session
 async function startSock() {
     console.log('[WhatsApp Agent] Initializing Baileys Socket...');
-    
+    waConnected = false;
+
     const { state, saveCreds } = await useMultiFileAuthState('whatsapp_auth_info');
     
     let version = [2, 3000, 1017531287]; // Default fallback "last known good" version
@@ -188,6 +198,7 @@ async function startSock() {
         }
         
         if (connection === 'close') {
+            waConnected = false;
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             console.log(`[WhatsApp Agent] Connection closed due to: ${lastDisconnect?.error?.message || 'Unknown'}. Reconnecting: ${shouldReconnect}`);
             
@@ -205,8 +216,9 @@ async function startSock() {
                 setTimeout(startSock, 5000);
             }
         } else if (connection === 'open') {
+            waConnected = true;
             console.log('[WhatsApp Agent] Connection established successfully!');
-            
+
             // Delete the QR file if it exists to avoid showing stale code
             const qrPath = path.join(__dirname, 'static', 'whatsapp_qr.png');
             if (fs.existsSync(qrPath)) {
