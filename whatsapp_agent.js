@@ -19,7 +19,16 @@ const pino = require('pino');
 // Express App Configuration
 const app = express();
 app.use(express.json());
-
+app.use(cors({
+    origin: [
+        "http://127.0.0.1:5500",
+        "http://localhost:5500"
+    ],
+    allowedHeaders: [
+        "Content-Type",
+        "x-api-key"
+    ]
+}));
 // The pairing QR is a live credential: whoever scans it links their own
 // WhatsApp Web session to this number. It sat under a public static mount, so
 // on a public hostname it was readable by anyone who guessed the path. This
