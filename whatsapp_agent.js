@@ -161,7 +161,7 @@ async function startSock() {
         sock = null;
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState('whatsapp_auth_info');
+    const { state, saveCreds } = await useMultiFileAuthState('whatsapp_auth_info_new');
     
     let version = [2, 3000, 1017531287]; // Default fallback "last known good" version
     try {
