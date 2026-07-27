@@ -15,6 +15,7 @@ const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
+const cors = require('cors');
 
 // Express App Configuration
 const app = express();
