@@ -35,15 +35,31 @@ app.use(cors({
 // on a public hostname it was readable by anyone who guessed the path. This
 // guarded route is registered *before* the static middleware so it wins.
 app.get('/static/whatsapp_qr.png', (req, res) => {
+
     if (!secretsMatch(req.get('x-api-key'), WHATSAPP_API_KEY)) {
-        console.warn(`[QR] Rejected an unauthorized QR fetch from ${req.ip}`);
-        return res.status(401).json({ error: 'Unauthorized' });
+        return res.status(401).json({
+            error: "Unauthorized"
+        });
     }
-    const qrPath = path.join(__dirname, 'static', 'whatsapp_qr.png');
+
+    const qrPath = path.join(
+        __dirname,
+        'static',
+        'whatsapp_qr.png'
+    );
+
     if (!fs.existsSync(qrPath)) {
-        return res.status(404).json({ error: 'No pairing QR is currently available.' });
+        return res.status(404).json({
+            error: "No QR available"
+        });
     }
-    return res.sendFile(qrPath);
+
+    res.setHeader(
+        'Cache-Control',
+        'no-store'
+    );
+
+    res.sendFile(qrPath);
 });
 
 app.use('/static', express.static(path.join(__dirname, 'static')));
