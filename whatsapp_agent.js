@@ -15,51 +15,25 @@ const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 const pino = require('pino');
-const cors = require('cors');
 
 // Express App Configuration
 const app = express();
 app.use(express.json());
-app.use(cors({
-    origin: [
-        "http://127.0.0.1:5500",
-        "http://localhost:5500"
-    ],
-    allowedHeaders: [
-        "Content-Type",
-        "x-api-key"
-    ]
-}));
+
 // The pairing QR is a live credential: whoever scans it links their own
 // WhatsApp Web session to this number. It sat under a public static mount, so
 // on a public hostname it was readable by anyone who guessed the path. This
 // guarded route is registered *before* the static middleware so it wins.
 app.get('/static/whatsapp_qr.png', (req, res) => {
-
     if (!secretsMatch(req.get('x-api-key'), WHATSAPP_API_KEY)) {
-        return res.status(401).json({
-            error: "Unauthorized"
-        });
+        console.warn(`[QR] Rejected an unauthorized QR fetch from ${req.ip}`);
+        return res.status(401).json({ error: 'Unauthorized' });
     }
-
-    const qrPath = path.join(
-        __dirname,
-        'static',
-        'whatsapp_qr.png'
-    );
-
+    const qrPath = path.join(__dirname, 'static', 'whatsapp_qr.png');
     if (!fs.existsSync(qrPath)) {
-        return res.status(404).json({
-            error: "No QR available"
-        });
+        return res.status(404).json({ error: 'No pairing QR is currently available.' });
     }
-
-    res.setHeader(
-        'Cache-Control',
-        'no-store'
-    );
-
-    res.sendFile(qrPath);
+    return res.sendFile(qrPath);
 });
 
 app.use('/static', express.static(path.join(__dirname, 'static')));
@@ -187,7 +161,7 @@ async function startSock() {
         sock = null;
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState('whatsapp_auth_info_new');
+    const { state, saveCreds } = await useMultiFileAuthState('whatsapp_auth_info');
     
     let version = [2, 3000, 1017531287]; // Default fallback "last known good" version
     try {
@@ -202,7 +176,8 @@ async function startSock() {
         version,
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: true
+        printQRInTerminal: true,
+        browser: ['Ubuntu', 'Chrome', '20.0.04']
     });
     
     sock.ev.on('creds.update', saveCreds);
@@ -355,6 +330,32 @@ async function startSock() {
 }
 
 // --- Express API Endpoints for Flask ---
+
+// POST /pair - Request a pairing code for a phone number
+app.post('/pair', async (req, res) => {
+    if (!secretsMatch(req.get('x-api-key'), WHATSAPP_API_KEY)) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { phone } = req.body;
+    if (!phone) {
+        return res.status(400).json({ error: 'Missing phone number' });
+    }
+
+    if (!sock) {
+        return res.status(503).json({ error: 'WhatsApp socket is not initialized' });
+    }
+
+    try {
+        console.log(`[WhatsApp Agent] Requesting pairing code for +${phone}...`);
+        const code = await sock.requestPairingCode(phone.replace(/[^0-9]/g, ''));
+        console.log(`[WhatsApp Agent] Pairing code generated: ${code}`);
+        return res.status(200).json({ code });
+    } catch (err) {
+        console.error('[WhatsApp Agent] Failed to request pairing code:', err.message);
+        return res.status(500).json({ error: err.message });
+    }
+});
 
 // POST /send - Admin broadcast dispatching endpoint.
 //
